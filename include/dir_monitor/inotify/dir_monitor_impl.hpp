@@ -27,17 +27,15 @@
 namespace boost {
 namespace asio {
 
-class dir_monitor_impl :
-    public std::enable_shared_from_this<dir_monitor_impl>
+class dir_monitor_impl
 {
 public:
     dir_monitor_impl()
         : fd_(init_fd()),
-        inotify_io_service_(new boost::asio::io_service()),
-        stream_descriptor_(new boost::asio::posix::stream_descriptor(*inotify_io_service_, fd_)),
-        inotify_work_(new boost::asio::io_service::work(*inotify_io_service_)),
-        inotify_work_thread_(boost::bind(&boost::asio::io_service::run, inotify_io_service_.get())),
-        run_(true)
+        run_(true),
+        inotify_work_(new boost::asio::io_service::work(inotify_io_service_)),
+        inotify_work_thread_(boost::bind(&boost::asio::io_service::run, &inotify_io_service_)),
+        stream_descriptor_(new boost::asio::posix::stream_descriptor(inotify_io_service_, fd_))
     {
     }
 
@@ -90,11 +88,9 @@ public:
     void destroy()
     {
         inotify_work_.reset();
-        stream_descriptor_.reset();
-        inotify_io_service_->stop();
+        inotify_io_service_.stop();
         inotify_work_thread_.join();
         stream_descriptor_.reset();
-        inotify_io_service_->stop();
 
         std::unique_lock<std::mutex> lock(events_mutex_);
         run_ = false;
@@ -104,17 +100,18 @@ public:
     dir_monitor_event popfront_event(boost::system::error_code &ec)
     {
         std::unique_lock<std::mutex> lock(events_mutex_);
-        while (run_ && events_.empty())
-            events_cond_.wait(lock);
+        events_cond_.wait(lock, [&]() { return !(run_ && events_.empty()); });
+        
         dir_monitor_event ev;
-        if (!events_.empty())
+        ec = boost::system::error_code();
+        if (!run_)
+            ec = boost::asio::error::operation_aborted;
+        else if (!events_.empty())
         {
-            ec = boost::system::error_code();
             ev = events_.front();
             events_.pop_front();
         }
-        else
-            ec = boost::asio::error::operation_aborted;
+            
         return ev;
     }
 
@@ -144,7 +141,7 @@ public:
     void begin_read()
     {
         stream_descriptor_->async_read_some(boost::asio::buffer(read_buffer_),
-            boost::bind(&dir_monitor_impl::end_read, shared_from_this(),
+            boost::bind(&dir_monitor_impl::end_read, this,
             boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
     }
 
@@ -193,10 +190,12 @@ private:
     }
 
     int fd_;
-    std::unique_ptr<boost::asio::io_service> inotify_io_service_;
-    std::unique_ptr<boost::asio::posix::stream_descriptor> stream_descriptor_;
+    bool run_;
+    boost::asio::io_service inotify_io_service_;
     std::unique_ptr<boost::asio::io_service::work> inotify_work_;
     std::thread inotify_work_thread_;
+    
+    std::unique_ptr<boost::asio::posix::stream_descriptor> stream_descriptor_;
     std::array<char, 4096> read_buffer_;
     std::string pending_read_buffer_;
     std::mutex watch_descriptors_mutex_;
@@ -204,7 +203,6 @@ private:
     watch_descriptors_t watch_descriptors_;
     std::mutex events_mutex_;
     std::condition_variable events_cond_;
-    bool run_;
     std::deque<dir_monitor_event> events_;
 };
 
